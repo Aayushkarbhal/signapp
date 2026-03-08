@@ -3,7 +3,6 @@ import datetime
 from flask import Flask, request, jsonify, send_from_directory
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
-from flask_jwt_extended import JWTManager, create_access_token
 from flask_socketio import SocketIO, emit
 from werkzeug.utils import secure_filename
 
@@ -14,13 +13,11 @@ UPLOAD_FOLDER = 'uploads'
 if not os.path.exists(UPLOAD_FOLDER): os.makedirs(UPLOAD_FOLDER)
 
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///signlearn_assignments.db'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///signlearn_final.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['JWT_SECRET_KEY'] = 'amey_assignment_pro_2026'
 
 CORS(app, resources={r"/*": {"origins": "http://localhost:5173"}})
 db = SQLAlchemy(app)
-jwt = JWTManager(app)
 socketio = SocketIO(app, cors_allowed_origins="http://localhost:5173")
 
 # --- MODELS ---
@@ -32,18 +29,20 @@ class User(db.Model):
 
 class Session(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    assignment_no = db.Column(db.Integer) # NEW: Sequence order
+    assignment_no = db.Column(db.Integer)
     title = db.Column(db.String(100))
     filename = db.Column(db.String(200))
 
 class Question(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    assignment_no = db.Column(db.Integer) # NEW: Link to assignment
-    topic = db.Column(db.String(100))
-    text = db.Column(db.String(200))
-    alt_a = db.Column(db.String(100))
-    alt_b = db.Column(db.String(100))
-    correct = db.Column(db.String(1))
+    assignment_no = db.Column(db.Integer)
+    text = db.Column(db.String(300))
+    image_url = db.Column(db.String(500), nullable=True)
+    opt_a = db.Column(db.String(100))
+    opt_b = db.Column(db.String(100))
+    opt_c = db.Column(db.String(100))
+    opt_d = db.Column(db.String(100))
+    correct_opt = db.Column(db.String(1))
 
 class QuizResult(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -51,79 +50,106 @@ class QuizResult(db.Model):
     topic = db.Column(db.String(100))
     score = db.Column(db.Integer)
     prediction = db.Column(db.String(50))
+    suggestion = db.Column(db.String(300))
 
 with app.app_context():
     db.create_all()
 
-# --- AUTH ---
+# --- ANALYZER LOGIC ---
+def get_analysis(score):
+    if score >= 90:
+        return {"pred": "Exceptional Mastery", "sugg": "Outstanding! You've mastered these signs perfectly.", "color": "green"}
+    elif score >= 70:
+        return {"pred": "Strong Progress", "sugg": "Great job! Watch the video once more to fix small errors.", "color": "blue"}
+    elif score >= 40:
+        return {"pred": "Developing", "sugg": "Good effort! Spend 5 more minutes with the video and try again.", "color": "orange"}
+    else:
+        return {"pred": "Needs Review", "sugg": "Don't give up! Let's watch the video together again.", "color": "red"}
+
+# --- ROUTES ---
+@app.route('/register', methods=['POST'])
+def register():
+    data = request.json
+    if User.query.filter_by(username=data['username']).first():
+        return jsonify({"error": "User already exists"}), 400
+    user = User(username=data['username'], password=data['password'], role=data['role'])
+    db.session.add(user)
+    db.session.commit()
+    return jsonify({"msg": "Success"})
+
 @app.route('/login', methods=['POST'])
 def login():
     data = request.json
     user = User.query.filter_by(username=data['username'], password=data['password']).first()
-    if not user:
-        user = User(username=data['username'], password=data['password'], role=data['role'])
-        db.session.add(user)
-        db.session.commit()
-    token = create_access_token(identity=user.username)
-    return jsonify(token=token, role=user.role, username=user.username)
+    if not user: return jsonify({"error": "Invalid login"}), 401
+    return jsonify({"role": user.role, "username": user.username})
 
-# --- TEACHER ASSIGNMENT CONTROL ---
 @app.route('/teacher/upload', methods=['POST'])
-def upload():
+def upload_video():
     file = request.files['file']
     title = request.form.get('title')
-    ano = request.form.get('assignment_no', 1)
+    ano = request.form.get('assignment_no')
     filename = secure_filename(file.filename)
     file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
     db.session.add(Session(title=title, filename=filename, assignment_no=int(ano)))
     db.session.commit()
-    return jsonify({"msg": "Uploaded"})
+    return jsonify({"msg": "Saved"})
+
+@app.route('/teacher/upload_image', methods=['POST'])
+def upload_image():
+    file = request.files['file']
+    filename = secure_filename(f"img_{datetime.datetime.now().timestamp()}_{file.filename}")
+    file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+    return jsonify({"url": f"http://localhost:5000/uploads/{filename}"})
 
 @app.route('/teacher/add_question', methods=['POST'])
 def add_q():
     data = request.json
     db.session.add(Question(
         assignment_no=int(data['assignment_no']),
-        topic=data['topic'], text=data['text'], 
-        alt_a=data['alt_a'], alt_b=data['alt_b'], correct=data['correct']
+        text=data['text'], image_url=data.get('image_url'),
+        opt_a=data['opt_a'], opt_b=data['opt_b'], opt_c=data['opt_c'], opt_d=data['opt_d'],
+        correct_opt=data['correct_opt']
     ))
     db.session.commit()
     return jsonify({"msg": "Saved"})
 
-@app.route('/teacher/stats', methods=['GET'])
-def get_stats():
-    res = QuizResult.query.order_by(QuizResult.id.desc()).all()
-    return jsonify([{"name": r.student_name, "topic": r.topic, "score": r.score, "prediction": r.prediction} for r in res])
-
-# --- STUDENT ASSIGNMENT PATH ---
-@app.route('/sessions', methods=['GET'])
-def sessions():
-    s = Session.query.order_by(Session.assignment_no.asc()).all()
-    return jsonify([{"title": x.title, "url": f"http://localhost:5000/uploads/{x.filename}", "ano": x.assignment_no} for x in s])
-
-@app.route('/uploads/<filename>')
-def serve(filename): return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
-
 @app.route('/student/quiz/<int:ano>', methods=['GET'])
 def get_quiz(ano):
     qs = Question.query.filter_by(assignment_no=ano).all()
-    return jsonify([{"id": q.id, "text": q.text, "a": q.alt_a, "b": q.alt_b, "correct": q.correct} for q in qs])
+    return jsonify([{
+        "text": q.text, "image": q.image_url, "correct": q.correct_opt,
+        "a": q.opt_a, "b": q.opt_b, "c": q.opt_c, "d": q.opt_d
+    } for q in qs])
 
 @app.route('/submit_quiz', methods=['POST'])
 def submit():
     data = request.json
     score = int(data['score'])
-    pred = "High Potential" if score >= 75 else "Needs Review"
-    res = QuizResult(student_name=data['username'], topic=data['topic'], score=score, prediction=pred)
+    analysis = get_analysis(score)
+    res = QuizResult(student_name=data['username'], topic=data['topic'], score=score, 
+                     prediction=analysis['pred'], suggestion=analysis['sugg'])
     db.session.add(res)
     db.session.commit()
-    socketio.emit('new_stat', {"name": data['username'], "topic": data['topic'], "score": score, "prediction": pred})
-    return jsonify({"prediction": pred, "score": score})
+    
+    payload = {"name": data['username'], "topic": data['topic'], "score": score, 
+               "prediction": analysis['pred'], "suggestion": analysis['sugg'], "color": analysis['color']}
+    socketio.emit('new_stat', payload)
+    return jsonify(payload)
 
-@socketio.on('message')
-def chat(data):
-    data['time'] = datetime.datetime.now().strftime("%I:%M %p")
-    emit('message', data, broadcast=True)
+@app.route('/sessions', methods=['GET'])
+def get_sessions():
+    s = Session.query.order_by(Session.assignment_no.asc()).all()
+    return jsonify([{"title": x.title, "url": f"http://localhost:5000/uploads/{x.filename}", "ano": x.assignment_no} for x in s])
+
+@app.route('/teacher/stats', methods=['GET'])
+def get_stats():
+    res = QuizResult.query.order_by(QuizResult.id.desc()).all()
+    return jsonify([{"name": r.student_name, "topic": r.topic, "score": r.score, 
+                     "prediction": r.prediction, "suggestion": r.suggestion} for r in res])
+
+@app.route('/uploads/<filename>')
+def serve(filename): return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
 if __name__ == '__main__':
     socketio.run(app, debug=True, port=5000)
